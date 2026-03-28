@@ -1,0 +1,33 @@
+name: Aruba Port Sync (Self-Hosted)
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'  # Runs every 5 minutes
+  workflow_dispatch:      # Allows you to click a button in GitHub to run it manually
+
+jobs:
+  run-sync:
+    # CRITICAL: This must match the label of your self-hosted runner
+    runs-on: self-hosted
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install Dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+          pip install netmiko openpyxl python-dotenv requests
+
+      - name: Execute Port Sync Script
+        env:
+          # This maps your GitHub Secrets to the Environment Variables the script uses
+          username: ${{ secrets.username }}
+          passwordAD: ${{ secrets.passwordAD }}
+          TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+        run: python3 config-ports-sync.py
