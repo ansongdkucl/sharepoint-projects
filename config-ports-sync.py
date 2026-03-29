@@ -2,10 +2,7 @@ import os
 import re
 import sys
 import argparse
-import time
-import datetime
 import requests
-import json
 from pathlib import Path
 from openpyxl import load_workbook
 from netmiko import ConnectHandler
@@ -18,149 +15,390 @@ load_dotenv()
 
 USERNAME = os.getenv("username")
 PASSWORD = os.getenv("passwordAD")
-TEAMS_WEBHOOK_URL = "https://liveuclac.webhook.office.com/webhookb2/4bf41ac1-0d61-4760-9dea-e0f6184dde8a@1faf88fe-a998-4c5b-93c9-210a11d9a5c2/IncomingWebhook/46bcd5e8d47e4de5b575fe10f189b1e1/43bfe760-7689-4d0b-96fd-46b265519580/V2OHjE1yNbt-Vi6fJNAiAdSwjM90ZnyOKY49V-zdJi0dA1"
+TEAMS_WEBHOOK_URL = os.getenv("TEAMS_WEBHOOK_URL", "")
 
-# Environment Detection
-is_github = os.getenv('GITHUB_ACTIONS') == 'true'
+# --- PATH AUTO-DISCOVERY ---
+ONEDRIVE_PATH = Path(
+    "/mnt/c/Users/cceadan/OneDrive - University College London/Estates IT - Project Documentation - Patching Schedule/90TCR - Daniel Test.xlsx"
+)
+DOWNLOADS_PATH = Path(
+    "/mnt/c/Users/cceadan/Downloads/90 TCR - Daniel-Test.xlsx"
+)
 
-# Path Management
-FILE_PATH = Path("/mnt/c/Users/cceadan/OneDrive - University College London/Estates IT - Project Documentation - Patching Schedule/90TCR - Daniel Test.xlsx")
-LOG_FILE = FILE_PATH.parent / "automation_audit.log"
+if ONEDRIVE_PATH.exists():
+    DEFAULT_PATH = ONEDRIVE_PATH
+elif DOWNLOADS_PATH.exists():
+    DEFAULT_PATH = DOWNLOADS_PATH
+else:
+    DEFAULT_PATH = ONEDRIVE_PATH
 
-def log_event(message):
-    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with open(LOG_FILE, "a") as f:
-        f.write(f"[{timestamp}] {message}\n")
+
+def log(msg):
+    print(msg, flush=True)
+
 
 def send_teams_notification(status, message, details=None):
-    if not TEAMS_WEBHOOK_URL: return 
-    color = {"SUCCESS": "28A745", "WARNING": "FFC107", "CRITICAL": "DC3545"}.get(status, "0078D7")
-    
-    sections = [{"activityTitle": f"**Aruba Sync: {status}**", "text": message}]
-    if details:
-        facts = [{"name": f"SW {d['ip']} Port {d['port']}", "value": f"VLAN {d['vlan']} | MAC: {d['mac']}"} for d in details]
-        sections[0]["facts"] = facts
+    if not TEAMS_WEBHOOK_URL:
+        return
 
-    payload = {"@type": "MessageCard", "@context": "http://schema.org/extensions", "themeColor": color, "sections": sections}
+    color = {
+        "SUCCESS": "28A745",
+        "WARNING": "FFC107",
+        "CRITICAL": "DC3545",
+    }.get(status, "0078D7")
+
+    facts = []
+    if details:
+        for entry in details:
+            facts.append(
+                {
+                    "name": f"Switch {entry['ip']}",
+                    "value": f"Port {entry['port']} -> VLAN {entry['vlan']}",
+                }
+            )
+
+    payload = {
+        "@type": "MessageCard",
+        "@context": "http://schema.org/extensions",
+        "themeColor": color,
+        "summary": "Aruba Config Update",
+        "sections": [
+            {
+                "activityTitle": f"**Aruba Configurator: {status}**",
+                "activitySubtitle": f"File: {DEFAULT_PATH.name}",
+                "text": message,
+                "facts": facts,
+            }
+        ],
+    }
+
     try:
-        requests.post(TEAMS_WEBHOOK_URL, json=payload, timeout=10)
-    except Exception as e:
-        print(f"[!] Webhook Failed: {e}")
+        response = requests.post(TEAMS_WEBHOOK_URL, json=payload, timeout=10)
+        response.raise_for_status()
+    except Exception as exc:
+        log(f"[!] Teams Alert Failed: {exc}")
+
+
+def get_lock_owner(path):
+    lock_path = path.parent / f"~${path.name}"
+    if not lock_path.exists():
+        return "Unknown (Closed)"
+
+    try:
+        with open(lock_path, "rb") as file_handle:
+            content = file_handle.read().decode("latin-1", errors="ignore")
+            match = re.search(r"[a-zA-Z\s]{3,}", content)
+            return match.group(0).strip() if match else "a Colleague"
+    except Exception:
+        return "a Colleague"
+
 
 def run_aruba_config(switch_ip, port, vlan_id):
-    device = {'device_type': 'aruba_osswitch', 'host': switch_ip, 'username': USERNAME, 'password': PASSWORD, 'global_delay_factor': 2}
-    commands = ["conf t", f"int {port}", f"vlan access {vlan_id}", "exit"]
-    result = {"mac": "Unknown", "ip": "No ARP", "status": "Error"}
-    
+    device = {
+        "device_type": "aruba_osswitch",
+        "host": switch_ip,
+        "username": USERNAME,
+        "password": PASSWORD,
+    }
+
+    commands = [
+        "aruba-central support-mode",
+        "conf t",
+        f"int {port}",
+        f"vlan access {vlan_id}",
+    ]
+
     try:
         with ConnectHandler(**device, conn_timeout=15) as net_connect:
             net_connect.send_config_set(commands)
-            
-            # MAC Discovery with Fallback
-            mac_out = net_connect.send_command(f"show mac-address {port}")
-            if "Invalid" in mac_out or not any(c.isdigit() for c in mac_out):
-                mac_out = net_connect.send_command(f"show mac-address-table int {port}")
-            
-            mac_match = re.search(r'([0-9a-fA-F]{2}[:.-]){5}[0-9a-fA-F]{2}|([0-9a-fA-F]{4}[.-]){2}[0-9a-fA-F]{4}', mac_out)
-            
-            if mac_match:
-                result["mac"] = mac_match.group(0)
-                # ARP Discovery
-                arp_out = net_connect.send_command(f"show arp")
-                ip_match = re.search(rf'(\d{{1,3}}\.\d{{1,3}}\.\d{{1,3}}\.\d{{1,3}}).*{re.escape(result["mac"])}', arp_out, re.IGNORECASE)
-                if ip_match:
-                    result["ip"] = ip_match.group(1)
-            
-            result["status"] = "Success"
-            return result
-    except Exception as e:
-        result["status"] = str(e)[:25]
-        return result
+
+            mac_out = net_connect.send_command(f"show mac-address-table int {port}")
+            mac_match = re.search(
+                r"([0-9a-fA-F]{2}[:.-]){5}[0-9a-fA-F]{2}",
+                mac_out,
+            )
+            found_mac = mac_match.group(0) if mac_match else "Unknown"
+
+            arp_out = net_connect.send_command(f"show arp | inc {found_mac}")
+            ip_match = re.search(r"(\d{1,3}\.){3}\d{1,3}", arp_out)
+            found_ip = ip_match.group(0) if ip_match else "No ARP"
+
+            return {
+                "mac": found_mac,
+                "ip": found_ip,
+                "status": "Success",
+            }
+
+    except Exception as exc:
+        return {
+            "mac": "Error",
+            "ip": "Error",
+            "status": str(exc)[:200],
+        }
+
+
+def confirm_change(safe_mode, switch_ip, port, current_vlan, target_vlan, row_idx):
+    if not safe_mode:
+        return True
+
+    if not os.isatty(0):
+        raise RuntimeError(
+            "--safe was supplied, but no interactive terminal is available."
+        )
+
+    print("\n" + "=" * 60)
+    print(f"[ACTION REQUIRED] Row {row_idx}: Port {port}")
+    print(f"VLAN Mismatch: [{current_vlan}] -> Target: [{target_vlan}]")
+    reply = input(f"Update Switch {switch_ip} Port {port}? (y/n): ").strip().lower()
+    return reply == "y"
+
+
+def build_header_maps(ws):
+    read_map = {}
+    write_map = {}
+
+    for col in range(1, ws.max_column + 1):
+        v2 = str(ws.cell(row=2, column=col).value or "").strip()
+        v3 = str(ws.cell(row=3, column=col).value or "").strip()
+
+        for header in (v2, v3):
+            if header == "VLAN":
+                read_map["vlan"] = col
+            elif header == "SWITCH IP":
+                read_map["switch"] = col
+            elif header == "PORT":
+                read_map["port"] = col
+            elif header == "ROOM":
+                read_map["room"] = col
+            elif header == "OUTLET":
+                read_map["outlet"] = col
+            elif header == "DEVICE":
+                read_map["device"] = col
+            elif header == "vlan":
+                write_map["vlan"] = col
+            elif header == "switch":
+                write_map["switch"] = col
+            elif header == "port":
+                write_map["port"] = col
+            elif header == "mac":
+                write_map["mac"] = col
+            elif header == "ip":
+                write_map["ip"] = col
+
+    return read_map, write_map
+
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--safe", action="store_true")
+    parser.add_argument(
+        "--safe",
+        action="store_true",
+        help="Confirm each change manually",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show changes without applying them",
+    )
     args = parser.parse_args()
 
-    # 1. Pre-Flight Checks
-    if not FILE_PATH.exists():
-        print(f"[!] Path Error: {FILE_PATH} not found."); return
+    log("[*] Script starting")
+    log(f"[*] Safe mode: {args.safe}")
+    log(f"[*] Dry run: {args.dry_run}")
+    log(f"[*] Candidate file path: {DEFAULT_PATH}")
 
-    if (FILE_PATH.parent / f"~${FILE_PATH.name}").exists():
-        msg = "Aborted: File is open in Excel."
-        print(f"[!] {msg}")
-        if is_github: send_teams_notification("CRITICAL", msg)
-        return
+    if not DEFAULT_PATH.exists():
+        log(f"[!] File not found: {DEFAULT_PATH}")
+        sys.exit(1)
 
-    # 2. Load Workbook
-    try:
-        wb = load_workbook(FILE_PATH, data_only=False)
-        ws = wb.active
-        print(f"[*] Loaded: {FILE_PATH.name}")
-    except Exception as e:
-        print(f"[!] Load Error: {e}"); return
+    if ONEDRIVE_PATH.exists():
+        log(f"[*] Using OneDrive Source: {ONEDRIVE_PATH.name}")
+    elif DOWNLOADS_PATH.exists():
+        log(f"[*] Using Backup Source (Downloads): {DOWNLOADS_PATH.name}")
 
-    # 3. Header Mapping (Restored logic)
-    read_map = {}; write_map = {}
-    for col in range(1, ws.max_column + 1):
-        v2 = str(ws.cell(row=2, column=col).value or "").strip().upper()
-        v3 = str(ws.cell(row=3, column=col).value or "").strip().lower()
-        if "VLAN" in v2: read_map["vlan_target"] = col
-        if "SWITCH IP" in v2: read_map["switch"] = col
-        if "PORT" in v2: read_map["port"] = col
-        if v3 == "vlan": write_map["vlan_curr"] = col
-        if v3 == "mac":  write_map["mac"] = col
-        if v3 == "ip":   write_map["ip"] = col
-        if v3 == "time": write_map["time"] = col
+    if not USERNAME or not PASSWORD:
+        log("[!] ERROR: Missing username/passwordAD environment variables.")
+        sys.exit(1)
 
-    # Verify Mapping Success
-    if not all(k in read_map for k in ["vlan_target", "switch", "port"]):
-        print("[!] Header Map Failed. Ensure row 2 has 'VLAN', 'SWITCH IP', 'PORT'."); return
+    lock_file = DEFAULT_PATH.parent / f"~${DEFAULT_PATH.name}"
+    if lock_file.exists():
+        owner = get_lock_owner(DEFAULT_PATH)
+        log(f"[!] ABORTED: File is currently open by {owner}.")
+        sys.exit(1)
 
-    updates = 0
+    start_mtime = os.path.getmtime(DEFAULT_PATH)
     config_summary = []
 
-    # 4. Processing Loop
-    for row in range(4, ws.max_row + 1):
-        s_ip = ws.cell(row=row, column=read_map["switch"]).value
-        port = ws.cell(row=row, column=read_map["port"]).value
-        v_target = ws.cell(row=row, column=read_map["vlan_target"]).value
-        v_curr = ws.cell(row=row, column=write_map.get("vlan_curr", 1)).value
+    try:
+        wb = load_workbook(DEFAULT_PATH, data_only=False)
+        ws = wb.active
+        log(f"[*] Workbook loaded: {DEFAULT_PATH}")
+        log(f"[*] Active sheet: {ws.title}")
+        log(f"[*] Max rows: {ws.max_row}, Max cols: {ws.max_column}")
+    except Exception as exc:
+        log(f"[!] Error loading workbook: {exc}")
+        sys.exit(1)
 
-        if not s_ip or not port or v_target is None: continue
-        if hasattr(port, 'strftime'): port = f"1/1/{port.day}"
+    read_map, write_map = build_header_maps(ws)
 
-        if str(v_target).strip() != str(v_curr).strip():
-            print(f"\n[ACTION] Row {row}: Port {port} | {v_curr} -> {v_target}")
-            
-            # Auto-approve for GitHub, prompt for --safe
-            if args.safe and not is_github:
-                if input("    Apply? (y/n): ").lower() != 'y': continue
+    log(f"[*] Read header map: {read_map}")
+    log(f"[*] Write header map: {write_map}")
 
-            res = run_aruba_config(str(s_ip), str(port), str(v_target))
-            
-            if res["status"] == "Success":
-                ws.cell(row=row, column=write_map["vlan_curr"], value=v_target)
-                if "mac" in write_map: ws.cell(row=row, column=write_map["mac"], value=res["mac"])
-                if "ip" in write_map:  ws.cell(row=row, column=write_map["ip"], value=res["ip"])
-                if "time" in write_map: ws.cell(row=row, column=write_map["time"], value=datetime.datetime.now().strftime("%H:%M"))
-                
-                updates += 1
-                config_summary.append({"ip": s_ip, "port": port, "vlan": v_target, "mac": res["mac"]})
-                log_event(f"SUCCESS: Row {row} | Port {port} | MAC: {res['mac']} | IP: {res['ip']}")
-                print(f"    [DONE] MAC: {res['mac']} | IP: {res['ip']}")
-            else:
-                print(f"    [FAIL] {res['status']}")
+    if not all(key in read_map for key in ("vlan", "switch", "port")):
+        log("[!] ERROR: Header mapping failed. Check row 2 and row 3.")
+        sys.exit(1)
 
-    # 5. Save
-    if updates > 0:
+    rows_processed = 0
+    rows_skipped = 0
+    rows_failed = 0
+    rows_declined = 0
+    candidate_changes = 0
+
+    if args.dry_run:
+        log("!!!!!!!!!!!!!!!!!!!! DRY RUN ACTIVE !!!!!!!!!!!!!!!!!!!!")
+
+    for row_idx in range(4, ws.max_row + 1):
+        switch_ip = ws.cell(row=row_idx, column=read_map["switch"]).value
+        port = ws.cell(row=row_idx, column=read_map["port"]).value
+        target_vlan = ws.cell(row=row_idx, column=read_map["vlan"]).value
+
+        current_vlan = None
+        if "vlan" in write_map:
+            current_vlan = ws.cell(row=row_idx, column=write_map["vlan"]).value
+
+        if not switch_ip or not port or target_vlan is None:
+            continue
+
+        if hasattr(port, "strftime"):
+            port = f"{port.month}-{port.day}"
+
+        switch_ip = str(switch_ip).strip()
+        port = str(port).strip()
+        target_vlan = str(target_vlan).strip()
+        current_vlan_str = "" if current_vlan is None else str(current_vlan).strip()
+
+        is_new = current_vlan is None or current_vlan_str == ""
+        is_different = target_vlan != current_vlan_str
+
+        if not (is_new or is_different):
+            rows_skipped += 1
+            continue
+
+        candidate_changes += 1
+
+        room = ws.cell(row=row_idx, column=read_map.get("room", 1)).value or "N/A"
+        outlet = ws.cell(row=row_idx, column=read_map.get("outlet", 1)).value or "N/A"
+
+        if args.dry_run:
+            log(
+                f"[DRY-RUN] Row {row_idx}: "
+                f"Room {room} | Outlet {outlet} | "
+                f"Switch {switch_ip} | Port {port} | "
+                f"Current VLAN {current_vlan_str or 'None'} -> Target VLAN {target_vlan}"
+            )
+            rows_processed += 1
+            continue
+
         try:
-            wb.save(FILE_PATH)
-            send_teams_notification("SUCCESS", f"Synced {updates} ports.", details=config_summary)
-            print(f"\n[+] Spreadsheet Updated.")
+            should_apply = confirm_change(
+                safe_mode=args.safe,
+                switch_ip=switch_ip,
+                port=port,
+                current_vlan=current_vlan_str or "None",
+                target_vlan=target_vlan,
+                row_idx=row_idx,
+            )
+        except RuntimeError as exc:
+            log(f"[!] {exc}")
+            sys.exit(1)
+
+        if not should_apply:
+            rows_declined += 1
+            log(f"[SKIPPED] Row {row_idx} declined by user.")
+            continue
+
+        log(
+            f"[*] Applying Row {row_idx} | "
+            f"Switch {switch_ip} | Port {port} | "
+            f"{current_vlan_str or 'None'} -> {target_vlan}"
+        )
+
+        result = run_aruba_config(switch_ip, port, target_vlan)
+
+        if result["status"] == "Success":
+            config_summary.append(
+                {
+                    "ip": switch_ip,
+                    "port": port,
+                    "vlan": target_vlan,
+                }
+            )
+
+            if "vlan" in write_map:
+                ws.cell(row=row_idx, column=write_map["vlan"], value=target_vlan)
+            if "mac" in write_map:
+                ws.cell(row=row_idx, column=write_map["mac"], value=result["mac"])
+            if "ip" in write_map:
+                ws.cell(row=row_idx, column=write_map["ip"], value=result["ip"])
+
+            rows_processed += 1
+            log(f"[DONE] Row {row_idx} | {switch_ip} | Port {port} -> VLAN {target_vlan}")
+        else:
+            rows_failed += 1
+            log(
+                f"[FAILED] Row {row_idx} | {switch_ip} | Port {port} | "
+                f"Error: {result['status']}"
+            )
+
+    log(
+        f"[*] Summary | Candidates: {candidate_changes} | Applied: {rows_processed} | "
+        f"Already Correct: {rows_skipped} | Declined: {rows_declined} | Failed: {rows_failed}"
+    )
+
+    if args.dry_run:
+        log("[*] Dry run finished successfully.")
+        sys.exit(0)
+
+    if rows_processed > 0:
+        if os.path.getmtime(DEFAULT_PATH) != start_mtime:
+            owner = get_lock_owner(DEFAULT_PATH)
+            send_teams_notification(
+                "CRITICAL",
+                f"Conflict detected. {owner} modified the file while the script was running.",
+            )
+            log("[!] File changed while script was running. Save aborted.")
+            sys.exit(1)
+
+        try:
+            wb.save(DEFAULT_PATH)
+            log("[+] Success: Spreadsheet updated.")
         except PermissionError:
-            print("\n[!] Save blocked by Excel. Hardware was updated, but record not saved.")
-            send_teams_notification("WARNING", "Hardware updated, but Excel save failed (File Open).")
+            owner = get_lock_owner(DEFAULT_PATH)
+            log(f"[!] SAVE FAILED: {owner} has the file open.")
+            sys.exit(1)
+        except Exception as exc:
+            log(f"[!] SAVE FAILED: {exc}")
+            sys.exit(1)
+
+    if rows_failed > 0:
+        send_teams_notification(
+            "WARNING",
+            f"Completed with errors. Applied {rows_processed} changes, but {rows_failed} failed.",
+            details=config_summary,
+        )
+        sys.exit(1)
+
+    if rows_processed > 0:
+        send_teams_notification(
+            "SUCCESS",
+            f"Successfully updated {rows_processed} ports.",
+            details=config_summary,
+        )
+        sys.exit(0)
+
+    log("[*] No spreadsheet changes needed.")
+    sys.exit(0)
+
 
 if __name__ == "__main__":
-    main()
+    main()p
