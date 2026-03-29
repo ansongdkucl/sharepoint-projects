@@ -2,11 +2,13 @@ import os
 import re
 import sys
 import argparse
-import requests
+from datetime import datetime
 from pathlib import Path
-from openpyxl import load_workbook
-from netmiko import ConnectHandler
+
+import requests
 from dotenv import load_dotenv
+from netmiko import ConnectHandler
+from openpyxl import load_workbook
 
 # ============================================================
 # 1. SETUP & CONFIGURATION
@@ -16,6 +18,21 @@ load_dotenv()
 USERNAME = os.getenv("username")
 PASSWORD = os.getenv("passwordAD")
 TEAMS_WEBHOOK_URL = os.getenv("TEAMS_WEBHOOK_URL", "")
+
+RUN_ACTOR = (
+    os.getenv("GITHUB_ACTOR")
+    or os.getenv("USER")
+    or os.getenv("USERNAME")
+    or "unknown"
+)
+
+RUN_SOURCE = (
+    "GitHub Actions"
+    if os.getenv("GITHUB_ACTIONS", "").lower() == "true"
+    else "Manual"
+)
+
+RUN_AT = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
 
 # --- PATH AUTO-DISCOVERY ---
 ONEDRIVE_PATH = Path(
@@ -33,8 +50,8 @@ else:
     DEFAULT_PATH = ONEDRIVE_PATH
 
 
-def log(msg):
-    print(msg, flush=True)
+def log(message):
+    print(message, flush=True)
 
 
 def send_teams_notification(status, message, details=None):
@@ -47,13 +64,24 @@ def send_teams_notification(status, message, details=None):
         "CRITICAL": "DC3545",
     }.get(status, "0078D7")
 
-    facts = []
+    facts = [
+        {"name": "Run By", "value": RUN_ACTOR},
+        {"name": "Run At", "value": RUN_AT},
+        {"name": "Source", "value": RUN_SOURCE},
+        {"name": "File", "value": DEFAULT_PATH.name},
+    ]
+
     if details:
         for entry in details:
             facts.append(
                 {
                     "name": f"Switch {entry['ip']}",
-                    "value": f"Port {entry['port']} -> VLAN {entry['vlan']}",
+                    "value": (
+                        f"Port {entry['port']} -> VLAN {entry['vlan']}\n"
+                        f"By: {entry['changed_by']}\n"
+                        f"At: {entry['changed_at']}\n"
+                        f"Source: {entry['source']}"
+                    ),
                 }
             )
 
@@ -206,6 +234,9 @@ def main():
     log(f"[*] Safe mode: {args.safe}")
     log(f"[*] Dry run: {args.dry_run}")
     log(f"[*] Candidate file path: {DEFAULT_PATH}")
+    log(f"[*] Run By: {RUN_ACTOR}")
+    log(f"[*] Run At: {RUN_AT}")
+    log(f"[*] Source: {RUN_SOURCE}")
 
     if not DEFAULT_PATH.exists():
         log(f"[!] File not found: {DEFAULT_PATH}")
@@ -317,23 +348,20 @@ def main():
             log(f"[SKIPPED] Row {row_idx} declined by user.")
             continue
 
+        changed_by = RUN_ACTOR
+        changed_at = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+        source = RUN_SOURCE
+
         log(
             f"[*] Applying Row {row_idx} | "
             f"Switch {switch_ip} | Port {port} | "
-            f"{current_vlan_str or 'None'} -> {target_vlan}"
+            f"{current_vlan_str or 'None'} -> {target_vlan} | "
+            f"By: {changed_by} | At: {changed_at} | Source: {source}"
         )
 
         result = run_aruba_config(switch_ip, port, target_vlan)
 
         if result["status"] == "Success":
-            config_summary.append(
-                {
-                    "ip": switch_ip,
-                    "port": port,
-                    "vlan": target_vlan,
-                }
-            )
-
             if "vlan" in write_map:
                 ws.cell(row=row_idx, column=write_map["vlan"], value=target_vlan)
             if "mac" in write_map:
@@ -341,13 +369,27 @@ def main():
             if "ip" in write_map:
                 ws.cell(row=row_idx, column=write_map["ip"], value=result["ip"])
 
+            config_summary.append(
+                {
+                    "ip": switch_ip,
+                    "port": port,
+                    "vlan": target_vlan,
+                    "changed_by": changed_by,
+                    "changed_at": changed_at,
+                    "source": source,
+                }
+            )
+
             rows_processed += 1
-            log(f"[DONE] Row {row_idx} | {switch_ip} | Port {port} -> VLAN {target_vlan}")
+            log(
+                f"[DONE] Row {row_idx} | {switch_ip} | Port {port} -> VLAN {target_vlan} | "
+                f"By: {changed_by} | At: {changed_at} | Source: {source}"
+            )
         else:
             rows_failed += 1
             log(
                 f"[FAILED] Row {row_idx} | {switch_ip} | Port {port} | "
-                f"Error: {result['status']}"
+                f"Error: {result['status']} | By: {changed_by} | At: {changed_at} | Source: {source}"
             )
 
     log(
