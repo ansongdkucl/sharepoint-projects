@@ -33,23 +33,47 @@ RUN_SOURCE = (
     else "Manual"
 )
 
-# --- PATH AUTO-DISCOVERY ---
-ONEDRIVE_PATH = Path(
-    "/mnt/c/Users/cceadan/OneDrive - University College London/Estates IT - Project Documentation - Patching Schedule/90TCR - Daniel Test.xlsx"
-    #"/mnt/c/Users/cceadan/OneDrive - University College London/Estates IT - Project Documentation - Patching Schedule/90TCR - Level 3B - Patching Schedule.xlsx"
+# ============================================================
+# PATH AUTO-DISCOVERY
+# ============================================================
+
+candidate_files = []
+
+# 1. Preferred: allow GitHub Actions or local .env to override file path
+if os.getenv("EXCEL_FILE"):
+    candidate_files.append(Path(os.getenv("EXCEL_FILE")))
+
+# 2. Windows GitHub runner paths
+candidate_files.extend(
+    [
+        Path(
+            r"C:\Users\cceadan\OneDrive - University College London\Estates IT - Project Documentation - Patching Schedule\90TCR - Daniel Test.xlsx"
+        ),
+        Path(
+            r"C:\Users\cceadan\OneDrive - University College London\Estates IT - Project Documentation - Patching Schedule\90TCR - Level 3B - Patching Schedule.xlsx"
+        ),
+        Path(
+            r"C:\Users\cceadan\Downloads\90 TCR - Daniel-Test.xlsx"
+        ),
+    ]
 )
 
-DOWNLOADS_PATH = Path(
-    "/mnt/c/Users/cceadan/Downloads/90 TCR - Daniel-Test.xlsx"
-   # "/mnt/c/Users/cceadan/Downloads/90 TCR - Daniel-Test.xlsx"
+# 3. WSL/Linux fallback paths
+candidate_files.extend(
+    [
+        Path(
+            "/mnt/c/Users/cceadan/OneDrive - University College London/Estates IT - Project Documentation - Patching Schedule/90TCR - Daniel Test.xlsx"
+        ),
+        Path(
+            "/mnt/c/Users/cceadan/OneDrive - University College London/Estates IT - Project Documentation - Patching Schedule/90TCR - Level 3B - Patching Schedule.xlsx"
+        ),
+        Path(
+            "/mnt/c/Users/cceadan/Downloads/90 TCR - Daniel-Test.xlsx"
+        ),
+    ]
 )
 
-if ONEDRIVE_PATH.exists():
-    DEFAULT_PATH = ONEDRIVE_PATH
-elif DOWNLOADS_PATH.exists():
-    DEFAULT_PATH = DOWNLOADS_PATH
-else:
-    DEFAULT_PATH = ONEDRIVE_PATH
+DEFAULT_PATH = next((p for p in candidate_files if p.exists()), candidate_files[0])
 
 
 # ============================================================
@@ -187,19 +211,6 @@ def send_teams_notification(status, message, details=None):
 # 4. EXCEL HEADER MAPPING
 # ============================================================
 def build_header_map(ws):
-    """
-    Expected useful columns:
-      G = VLAN
-      H = SWITCH IP
-      I = PORT
-      L = mac
-      M = ip
-      N = Last Checked
-      O = notes
-
-    We scan rows 2 and 3 and keep the rightmost match, so the lowercase
-    notes column on O wins over the earlier Notes column.
-    """
     aliases = {
         "target_vlan": {"vlan"},
         "switch_ip": {"switch ip"},
@@ -243,7 +254,7 @@ def write_readonly_columns(ws, row_idx, header_map, mac="", ip="", last_checked=
 
 
 # ============================================================
-# 5. SWITCH HELPERS (ARUBA CX)
+# 5. SWITCH HELPERS
 # ============================================================
 def connect_to_switch(switch_ip):
     device = {
@@ -258,7 +269,6 @@ def connect_to_switch(switch_ip):
 
 
 def prepare_switch_session(net_connect):
-    # Best effort only
     try:
         net_connect.send_command_timing("no page")
     except Exception:
@@ -271,11 +281,6 @@ def prepare_switch_session(net_connect):
 
 
 def parse_show_int_br(output):
-    """
-    Parse lines like:
-    1/1/12         915     access ...
-    Returns: {"1/1/12": "915", ...}
-    """
     port_vlan_map = {}
 
     for line in output.splitlines():
@@ -309,7 +314,6 @@ def get_port_mac(net_connect, port):
         except Exception:
             continue
 
-    # fallback: full table
     try:
         output = net_connect.send_command("show mac-address-table", read_timeout=60)
         for line in output.splitlines():
@@ -353,9 +357,6 @@ def get_port_live_details(net_connect, port):
 
 
 def apply_vlan_change(net_connect, port, target_vlan):
-    """
-    Uses timing-based sends to avoid prompt-detection issues.
-    """
     output = ""
     output += net_connect.send_command_timing("configure terminal")
     output += net_connect.send_command_timing(f"interface {port}")
@@ -381,7 +382,9 @@ def main():
     log(f"[*] Source: {RUN_SOURCE}")
 
     if not DEFAULT_PATH.exists():
-        log(f"[!] File not found: {DEFAULT_PATH}")
+        log("[!] File not found in any candidate path:")
+        for p in candidate_files:
+            log(f"    - {p}")
         sys.exit(1)
 
     if not USERNAME or not PASSWORD:
@@ -415,7 +418,6 @@ def main():
         log(f"[!] ERROR: Missing required headers: {missing}")
         sys.exit(1)
 
-    # Group rows by switch to avoid reconnecting for every line
     rows_by_switch = defaultdict(list)
 
     for row_idx in range(4, ws.max_row + 1):
@@ -445,7 +447,6 @@ def main():
     rows_declined = 0
     candidate_changes = 0
     workbook_touched = False
-
     config_summary = []
 
     if args.dry_run:
@@ -570,7 +571,6 @@ def main():
                         )
                         workbook_touched = True
 
-                # verify any attempted changes
                 if pending_verification:
                     live_vlan_map_after = get_live_vlan_map(net_connect)
 
