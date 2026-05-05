@@ -1,0 +1,38 @@
+{
+  "rules": [
+    {
+      "name": "Access point",
+      "prefixes": ["d4:19:72"],
+      "allowed_vlans": ["990"]
+    },
+    {
+      "name": "CCTV",
+      "prefixes": ["00:04:7d"],
+      "allowed_vlans": ["915"]
+    },
+    {
+      "name": "Gallagher",
+      "prefixes": ["00:90:1d"],
+      "allowed_vlans": ["487"]
+    },
+    {
+      "name": "UPS",
+      "prefixes": ["28:29:86"],
+      "allowed_vlans": ["770"]
+    },
+    {
+      "name": "AV",
+      "prefixes": [
+        "c4:42:68",
+        "ac:a6:67",
+        "00:1b:66",
+        "00:0e:dd",
+        "24:78:23",
+        "90:8d:6e",
+        "00:07:ce",
+        "34:d0:b8"
+      ],
+      "allowed_vlans": ["909", "520", "530", "707","1909","1920"]
+    }
+  ]
+}
