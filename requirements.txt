@@ -1,0 +1,6 @@
+msal
+netmiko
+openpyxl
+pandas
+python-dotenv
+requests
