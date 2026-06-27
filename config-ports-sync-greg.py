@@ -1,4 +1,4 @@
-import os, re, sys, argparse, requests, platform
+import os, re, sys, argparse, requests, platform, tempfile
 from datetime import datetime
 from pathlib import Path
 from collections import defaultdict
@@ -21,7 +21,10 @@ RUN_SOURCE = "GitHub Actions" if os.getenv("GITHUB_ACTIONS", "").lower() == "tru
 
 WORKBOOK_NAME = "FC-MSA-CI.xlsx"
 WORKBOOK_DIR = r"University College London\ISD.ITSD.CO.Technical Specialists - patching"
-WINDOWS_WORKBOOK_PATH = rf"C:\Users\anson\{WORKBOOK_DIR}\{WORKBOOK_NAME}"
+WINDOWS_WORKBOOK_PATHS = [
+    rf"C:\Users\anson\{WORKBOOK_DIR}\{WORKBOOK_NAME}",
+    rf"C:\Users\cceadan\{WORKBOOK_DIR}\{WORKBOOK_NAME}",
+]
 
 
 def normalize_workbook_path(value):
@@ -36,9 +39,12 @@ def normalize_workbook_path(value):
 
     return Path(path_text)
 
+def first_existing_path(values):
+    paths = [normalize_workbook_path(v) for v in values if v]
+    return next((p for p in paths if p.exists()), paths[0])
 
 # Fixed workbook path for testing - supports Windows and WSL/Linux
-DEFAULT_PATH = normalize_workbook_path(os.getenv("WORKBOOK_PATH") or WINDOWS_WORKBOOK_PATH)
+DEFAULT_PATH = first_existing_path([os.getenv("WORKBOOK_PATH"), *WINDOWS_WORKBOOK_PATHS])
 
 # ============================================================
 # 2. GENERAL & CELL HELPERS
@@ -77,6 +83,63 @@ def get_lock_owner(path):
         ).strip() or "a Colleague"
     except Exception:
         return "a Colleague"
+
+def read_only_mount_for(path):
+    if os.name == "nt":
+        return None
+
+    try:
+        path = Path(path).resolve()
+        mounts = []
+        with open("/proc/mounts", encoding="utf-8") as fh:
+            for line in fh:
+                parts = line.split()
+                if len(parts) >= 4:
+                    mount_point = Path(parts[1].replace("\\040", " "))
+                    mounts.append((mount_point, parts[3].split(",")))
+    except OSError:
+        return None
+
+    matches = [
+        (mount_point, options)
+        for mount_point, options in mounts
+        if path == mount_point or mount_point in path.parents
+    ]
+    if not matches:
+        return None
+
+    mount_point, options = max(matches, key=lambda item: len(str(item[0])))
+    return mount_point if "ro" in options else None
+
+def assert_workbook_save_ready(path):
+    read_only_mount = read_only_mount_for(path)
+    if read_only_mount:
+        raise RuntimeError(
+            f"Workbook is under read-only mount {read_only_mount}. "
+            "Restart WSL or remount the drive read-write before running the script."
+        )
+
+    try:
+        with tempfile.NamedTemporaryFile(prefix=".write-test-", suffix=".tmp", dir=path.parent, delete=True):
+            pass
+    except PermissionError as exc:
+        raise RuntimeError(
+            f"Cannot write to workbook folder: {path.parent}. "
+            "Close Excel, check OneDrive/SharePoint sync, and make sure the drive is mounted read-write."
+        ) from exc
+    except OSError as exc:
+        raise RuntimeError(f"Workbook folder is not writable: {path.parent} ({exc})") from exc
+
+    try:
+        with open(path, "r+b"):
+            pass
+    except PermissionError as exc:
+        raise RuntimeError(
+            f"Workbook is not writable: {path}. "
+            "Close Excel, wait for OneDrive/SharePoint sync to finish, and check that the file is not marked read-only."
+        ) from exc
+    except OSError as exc:
+        raise RuntimeError(f"Workbook cannot be opened for writing: {path} ({exc})") from exc
 
 def confirm_change(safe, ip, port, cur, tgt, row, s_name):
     if not safe:
@@ -426,9 +489,31 @@ def build_vlan_change_groups(items):
 
     return sorted(groups, key=lambda x: x["order"])
 
+CLI_ERROR_PATTERNS = (
+    "Invalid input",
+    "Incomplete command",
+    "Ambiguous command",
+    "Unknown command",
+    "Command failed",
+    "Error:",
+)
+
+def compact_cli_output(text):
+    lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+    return " | ".join(lines)[-300:]
+
+def find_cli_error(output):
+    for line in str(output or "").splitlines():
+        if any(pattern.lower() in line.lower() for pattern in CLI_ERROR_PATTERNS):
+            return line.strip()
+    return ""
+
 def apply_vlan_change(conn, interface, vlan):
     for cmd in ["configure terminal", f"interface {interface}", f"vlan access {vlan}", "end"]:
-        conn.send_command_timing(cmd)
+        output = conn.send_command_timing(cmd)
+        error = find_cli_error(output)
+        if error:
+            raise RuntimeError(f"Command `{cmd}` failed: {error} | Output: {compact_cli_output(output)}")
 
 # ============================================================
 # 6. PIPELINE CONTROLLER
@@ -469,6 +554,12 @@ def main():
     lk = DEFAULT_PATH.parent / f"~${DEFAULT_PATH.name}"
     if lk.exists():
         log(f"[!] ABORTED: Open by {get_lock_owner(DEFAULT_PATH)}.")
+        sys.exit(1)
+
+    try:
+        assert_workbook_save_ready(DEFAULT_PATH)
+    except RuntimeError as exc:
+        log(f"[!] ABORTED: {exc}")
         sys.exit(1)
 
     start_mtime = os.path.getmtime(DEFAULT_PATH)
@@ -693,7 +784,18 @@ def main():
                                 })
                             else:
                                 stats["fail"] += 1
-                                log(f"[FAILED] Row {item['row_idx']} verify failed. Live VLAN is {v_fin}")
+                                if v_fin == "Unknown":
+                                    failure_reason = f"port {item['port']} was not found in `show int br` after apply"
+                                elif v_fin == item["old_vlan"]:
+                                    failure_reason = "switch still reports the old VLAN after apply"
+                                else:
+                                    failure_reason = "switch reports a different VLAN than requested"
+
+                                log(
+                                    f"[FAILED] Row {item['row_idx']} verify failed on {sw_ip} Port {item['port']} | "
+                                    f"Expected VLAN {item['target_vlan']} | Old VLAN {item['old_vlan']} | "
+                                    f"Live VLAN {v_fin} | Reason: {failure_reason}"
+                                )
                                 write_result_columns(
                                     ws,
                                     item["row_idx"],
@@ -704,7 +806,10 @@ def main():
                                     mac=dt["mac"],
                                     ip=dt["ip"],
                                     checked_at=now_str(),
-                                    notes="Failed to change."
+                                    notes=(
+                                        f"Failed to change: expected VLAN {item['target_vlan']}, "
+                                        f"live VLAN {v_fin}. {failure_reason}"
+                                    )[:255]
                                 )
 
                             wb_touch = True
