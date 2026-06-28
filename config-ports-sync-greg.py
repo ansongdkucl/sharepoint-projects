@@ -1,4 +1,4 @@
-import os, re, sys, argparse, requests, platform, tempfile
+import os, re, sys, argparse, requests, platform, tempfile, subprocess, time
 from datetime import datetime
 from pathlib import Path
 from collections import defaultdict
@@ -141,6 +141,104 @@ def assert_workbook_save_ready(path):
     except OSError as exc:
         raise RuntimeError(f"Workbook cannot be opened for writing: {path} ({exc})") from exc
 
+def windows_excel_path(path):
+    path = Path(path)
+    text = str(path)
+
+    if os.name == "nt":
+        return text
+
+    match = re.match(r"^/mnt/([a-zA-Z])/(.*)$", text)
+    if not match:
+        return text
+
+    drive, rest = match.groups()
+    rest = rest.replace("/", "\\")
+    return f"{drive.upper()}:\\{rest}"
+
+def wait_for_excel_lock_to_clear(path, timeout=30):
+    lock_path = path.parent / f"~${path.name}"
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not lock_path.exists():
+            return True
+        time.sleep(1)
+    return False
+
+def open_save_close_in_excel(path):
+    if os.getenv("SKIP_EXCEL_PRE_SYNC", "").strip().lower() in {"1", "true", "yes"}:
+        log(f"[*] Excel pre-sync skipped for {path.name} because SKIP_EXCEL_PRE_SYNC is set.")
+        return
+
+    lock_path = path.parent / f"~${path.name}"
+    if lock_path.exists():
+        raise RuntimeError(f"Workbook is already open by {get_lock_owner(path)}.")
+
+    excel_path = windows_excel_path(path)
+    log(f"[*] Opening and saving in Excel to refresh SharePoint/OneDrive sync: {path.name}")
+
+    if os.name == "nt":
+        try:
+            import win32com.client
+        except ImportError as exc:
+            raise RuntimeError(
+                "pywin32 is required for Excel pre-sync on Windows. Install it with: pip install pywin32"
+            ) from exc
+
+        excel = win32com.client.DispatchEx("Excel.Application")
+        excel.DisplayAlerts = False
+        excel.Visible = False
+        wb = None
+        try:
+            wb = excel.Workbooks.Open(excel_path, UpdateLinks=0, ReadOnly=False)
+            wb.Save()
+        finally:
+            if wb is not None:
+                wb.Close(SaveChanges=False)
+            excel.Quit()
+    else:
+        ps_script = r"""
+$path = $args[0]
+$excel = New-Object -ComObject Excel.Application
+$excel.DisplayAlerts = $false
+$excel.Visible = $false
+$workbook = $null
+try {
+    $workbook = $excel.Workbooks.Open($path, 0, $false)
+    $workbook.Save()
+} finally {
+    if ($workbook -ne $null) {
+        $workbook.Close($false)
+        [System.Runtime.InteropServices.Marshal]::ReleaseComObject($workbook) | Out-Null
+    }
+    $excel.Quit()
+    [System.Runtime.InteropServices.Marshal]::ReleaseComObject($excel) | Out-Null
+    [GC]::Collect()
+    [GC]::WaitForPendingFinalizers()
+}
+"""
+        try:
+            result = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_script, excel_path],
+                capture_output=True,
+                text=True,
+                timeout=120,
+                check=False,
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError(
+                "powershell.exe was not found. Excel pre-sync needs Windows PowerShell when running from WSL."
+            ) from exc
+
+        if result.returncode != 0:
+            details = (result.stderr or result.stdout or "").strip()
+            raise RuntimeError(f"Excel pre-sync failed: {details}")
+
+    if not wait_for_excel_lock_to_clear(path):
+        raise RuntimeError(f"Excel lock did not clear after saving {path.name}.")
+
+    log(f"[+] Excel pre-sync complete: {path.name}")
+
 def confirm_change(safe, ip, port, cur, tgt, row, s_name):
     if not safe:
         return True
@@ -156,61 +254,80 @@ def confirm_change(safe, ip, port, cur, tgt, row, s_name):
 # ============================================================
 # 3. TEAMS ENGINE
 # ============================================================
-def build_adaptive_card(status, message, details=None):
+def build_teams_text(status, stats, report):
+    lines = [
+        f"Aruba Port Sync: {status}",
+        "",
+        f"Run by: {RUN_ACTOR}",
+        f"Run at: {now_str()}",
+        f"Source: {RUN_SOURCE}",
+        f"File: {DEFAULT_PATH.name}",
+        "",
+        (
+            f"Summary: checked {stats['chk']}, changed {stats['chg']}, "
+            f"already correct {stats['ok']}, failed {stats['fail']}, declined {stats['dec']}"
+        ),
+    ]
+
+    sections = [
+        ("Changed", report["changed"]),
+        ("Already correct", report["unchanged"]),
+        ("Declined", report["declined"]),
+        ("Failed", report["failed"]),
+    ]
+
+    for title, entries in sections:
+        lines.extend(["", f"{title}: {len(entries)}"])
+        if not entries:
+            lines.append("- None")
+            continue
+
+        for e in entries[:25]:
+            line = (
+                f"- {e['sheet']} row {e['row']} | {e['switch']} | Port {e['port']} | "
+                f"{e.get('old_vlan', 'Unknown')} -> {e.get('target_vlan', e.get('live_vlan', 'Unknown'))}"
+            )
+            if e.get("live_vlan") and e["live_vlan"] != e.get("target_vlan"):
+                line += f" | Live: {e['live_vlan']}"
+            if e.get("reason"):
+                line += f" | {e['reason']}"
+            lines.append(line)
+
+        if len(entries) > 25:
+            lines.append(f"- ...and {len(entries) - 25} more")
+
+    return "\n".join(lines)
+
+def build_text_card(status, text):
     color = {
         "SUCCESS": "Good",
         "WARNING": "Warning",
         "CRITICAL": "Attention",
     }.get(status, "Accent")
 
-    facts = [
-        {"title": "Run By", "value": RUN_ACTOR},
-        {"title": "Run At", "value": now_str()},
-        {"title": "Source", "value": RUN_SOURCE},
-        {"title": "File", "value": DEFAULT_PATH.name},
-    ]
-
-    body = [
-        {
-            "type": "TextBlock",
-            "text": f"Aruba Configurator: {status}",
-            "weight": "Bolder",
-            "size": "Medium",
-            "color": color,
-            "wrap": True,
-        },
-        {
-            "type": "TextBlock",
-            "text": message,
-            "wrap": True,
-        },
-        {
-            "type": "FactSet",
-            "facts": facts,
-        },
-    ]
-
-    for e in (details or []):
-        body.append({
-            "type": "TextBlock",
-            "text": (
-                f"**{e['sheet']} | {e['ip']}**\n\n"
-                f"Port {e['port']} -> VLAN {e['target_vlan']}\n\n"
-                f"Previous Live VLAN: {e['old_vlan']}\n\n"
-                f"By: {e['changed_by']}\n\n"
-                f"At: {e['changed_at']}\n\n"
-                f"Source: {e['source']}"
-            ),
-            "wrap": True,
-            "spacing": "Medium",
-        })
-
     return {
         "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
         "type": "AdaptiveCard",
         "version": "1.4",
-        "body": body,
+        "body": [
+            {
+                "type": "TextBlock",
+                "text": f"Aruba Port Sync: {status}",
+                "weight": "Bolder",
+                "size": "Medium",
+                "color": color,
+                "wrap": True,
+            },
+            {
+                "type": "TextBlock",
+                "text": text,
+                "wrap": True,
+            },
+        ],
     }
+
+def build_adaptive_card(status, message, details=None):
+    return build_text_card(status, message)
 
 def send_teams_notification(status, message, details=None):
     if not TEAMS_WEBHOOK_URL:
@@ -219,11 +336,20 @@ def send_teams_notification(status, message, details=None):
     try:
         requests.post(
             TEAMS_WEBHOOK_URL,
-            json={"adaptive_card": build_adaptive_card(status, message, details)},
+            json={"text": message, "adaptive_card": build_text_card(status, message)},
             timeout=10
         ).raise_for_status()
     except Exception as exc:
         log(f"[!] Teams Alert Failed: {exc}")
+
+def record_report(report, bucket, **entry):
+    report[bucket].append(entry)
+
+def log_row_failure(row, switch_ip, port, target_vlan, reason, live_vlan="Unknown", old_vlan="Unknown"):
+    log(
+        f"[FAILED] Row {row} | Switch {switch_ip} | Port {port} | "
+        f"Old VLAN {old_vlan} | Target VLAN {target_vlan} | Live VLAN {live_vlan} | Reason: {reason}"
+    )
 
 # ============================================================
 # 4. EXCEL SCANNING / BLOCK PARSING
@@ -551,6 +677,12 @@ def main():
         log("[!] Missing environment variable: passwordAD")
         sys.exit(1)
 
+    try:
+        open_save_close_in_excel(DEFAULT_PATH)
+    except RuntimeError as exc:
+        log(f"[!] ABORTED: {exc}")
+        sys.exit(1)
+
     lk = DEFAULT_PATH.parent / f"~${DEFAULT_PATH.name}"
     if lk.exists():
         log(f"[!] ABORTED: Open by {get_lock_owner(DEFAULT_PATH)}.")
@@ -581,8 +713,7 @@ def main():
 
     stats = {"chk": 0, "ok": 0, "chg": 0, "fail": 0, "dec": 0}
     wb_touch = False
-    summary = []
-    no_change_highlights = []
+    report = {"changed": [], "unchanged": [], "declined": [], "failed": []}
 
     if args.dry_run:
         log("!!!!!!!!!!!!!!!!!!!! DRY RUN ACTIVE !!!!!!!!!!!!!!!!!!!!")
@@ -616,7 +747,47 @@ def main():
                     "cell": ws.cell(row=r, column=cols["input_vlan"])
                 })
             else:
-                skipped_highlights.append(r)
+                missing = [
+                    name
+                    for name, value in [("switch", sw), ("port", pt), ("target VLAN", tg)]
+                    if not value
+                ]
+                reason = f"Highlighted row skipped because missing {', '.join(missing)}"
+                skipped_highlights.append(f"{r} ({reason})")
+                stats["fail"] += 1
+                log_row_failure(
+                    r,
+                    sw or "Unknown",
+                    pt or "Unknown",
+                    tg or "Unknown",
+                    reason,
+                )
+                record_report(
+                    report,
+                    "failed",
+                    sheet=b["sheet_name"],
+                    row=r,
+                    switch=sw or "Unknown",
+                    port=pt or "Unknown",
+                    old_vlan="Unknown",
+                    target_vlan=tg or "Unknown",
+                    live_vlan="Unknown",
+                    reason=reason,
+                )
+                if not args.dry_run:
+                    write_result_columns(
+                        ws,
+                        r,
+                        cols,
+                        switch_ip=sw or "Unknown",
+                        port=pt or "Unknown",
+                        vlan="Unknown",
+                        mac="N/A",
+                        ip="N/A",
+                        checked_at=now_str(),
+                        notes=reason[:255],
+                    )
+                    wb_touch = True
 
         log(f"[*] Highlighted rows queued in this block: {highlighted_rows}")
         if skipped_highlights:
@@ -664,6 +835,18 @@ def main():
                         if cur_v == tg:
                             stats["ok"] += 1
                             log(f"[OK] Row {r} already on correct VLAN")
+                            record_report(
+                                report,
+                                "unchanged",
+                                sheet=b["sheet_name"],
+                                row=r,
+                                switch=sw_ip,
+                                port=pt,
+                                old_vlan=cur_v,
+                                target_vlan=tg,
+                                live_vlan=cur_v,
+                                reason="No change needed",
+                            )
                             if not args.dry_run:
                                 for k, v in {
                                     "out_switch": sw_ip,
@@ -676,13 +859,6 @@ def main():
                                         ws.cell(row=r, column=cols[k], value=v)
                                 clear_yellow_highlight(ws, r)
                                 wb_touch = True
-                                no_change_highlights.append({
-                                    "sheet": b["sheet_name"],
-                                    "row": r,
-                                    "ip": sw_ip,
-                                    "port": pt,
-                                    "vlan": tg,
-                                })
                             continue
 
                         if args.dry_run:
@@ -692,7 +868,20 @@ def main():
                         if not confirm_change(args.safe, sw_ip, pt, cur_v, tg, r, b["sheet_name"]):
                             dt = get_port_live_details(conn, e["port"])
                             stats["dec"] += 1
-                            log(f"[SKIPPED] Row {r} declined")
+                            reason = "Change declined in safe mode"
+                            log(f"[SKIPPED] Row {r} | Switch {sw_ip} | Port {pt} | Reason: {reason}")
+                            record_report(
+                                report,
+                                "declined",
+                                sheet=b["sheet_name"],
+                                row=r,
+                                switch=sw_ip,
+                                port=pt,
+                                old_vlan=cur_v,
+                                target_vlan=tg,
+                                live_vlan=cur_v,
+                                reason=reason,
+                            )
                             write_result_columns(
                                 ws,
                                 r,
@@ -727,9 +916,30 @@ def main():
                             apply_vlan_change(conn, group["interface"], group["target_vlan"])
                             pending.extend(group["items"])
                         except Exception as exc:
+                            reason = str(exc)[:250]
                             for item in group["items"]:
                                 stats["fail"] += 1
-                                log(f"[FAILED] Row {item['row_idx']} apply error: {exc}")
+                                log_row_failure(
+                                    item["row_idx"],
+                                    sw_ip,
+                                    item["port"],
+                                    item["target_vlan"],
+                                    reason,
+                                    live_vlan=item["old_vlan"],
+                                    old_vlan=item["old_vlan"],
+                                )
+                                record_report(
+                                    report,
+                                    "failed",
+                                    sheet=b["sheet_name"],
+                                    row=item["row_idx"],
+                                    switch=sw_ip,
+                                    port=item["port"],
+                                    old_vlan=item["old_vlan"],
+                                    target_vlan=item["target_vlan"],
+                                    live_vlan=item["old_vlan"],
+                                    reason=f"Apply failed: {reason}",
+                                )
                                 write_result_columns(
                                     ws,
                                     item["row_idx"],
@@ -772,15 +982,15 @@ def main():
                                     checked_at=now_str()
                                 )
                                 clear_yellow_highlight(ws, item["row_idx"])
-                                summary.append({
+                                record_report(report, "changed", **{
                                     "sheet": b["sheet_name"],
-                                    "ip": sw_ip,
+                                    "row": item["row_idx"],
+                                    "switch": sw_ip,
                                     "port": item["port"],
                                     "target_vlan": item["target_vlan"],
                                     "old_vlan": item["old_vlan"],
-                                    "changed_by": RUN_ACTOR,
-                                    "changed_at": now_str(),
-                                    "source": RUN_SOURCE
+                                    "live_vlan": v_fin,
+                                    "reason": "Verified after apply",
                                 })
                             else:
                                 stats["fail"] += 1
@@ -791,10 +1001,26 @@ def main():
                                 else:
                                     failure_reason = "switch reports a different VLAN than requested"
 
-                                log(
-                                    f"[FAILED] Row {item['row_idx']} verify failed on {sw_ip} Port {item['port']} | "
-                                    f"Expected VLAN {item['target_vlan']} | Old VLAN {item['old_vlan']} | "
-                                    f"Live VLAN {v_fin} | Reason: {failure_reason}"
+                                log_row_failure(
+                                    item["row_idx"],
+                                    sw_ip,
+                                    item["port"],
+                                    item["target_vlan"],
+                                    failure_reason,
+                                    live_vlan=v_fin,
+                                    old_vlan=item["old_vlan"],
+                                )
+                                record_report(
+                                    report,
+                                    "failed",
+                                    sheet=b["sheet_name"],
+                                    row=item["row_idx"],
+                                    switch=sw_ip,
+                                    port=item["port"],
+                                    old_vlan=item["old_vlan"],
+                                    target_vlan=item["target_vlan"],
+                                    live_vlan=v_fin,
+                                    reason=f"Verify failed: {failure_reason}",
                                 )
                                 write_result_columns(
                                     ws,
@@ -815,10 +1041,30 @@ def main():
                             wb_touch = True
 
             except Exception as exc:
-                log(f"[!] Switch connection/processing failure on {sw_ip}: {exc}")
+                reason = str(exc)[:250]
+                log(f"[!] Switch connection/processing failure on {sw_ip}: {reason}")
                 stats["fail"] += len(entries)
                 if not args.dry_run:
                     for e in entries:
+                        log_row_failure(
+                            e["row_idx"],
+                            sw_ip,
+                            e["port"],
+                            e["target_vlan"],
+                            f"Switch connection/processing failed: {reason}",
+                        )
+                        record_report(
+                            report,
+                            "failed",
+                            sheet=b["sheet_name"],
+                            row=e["row_idx"],
+                            switch=sw_ip,
+                            port=e["port"],
+                            old_vlan="Unknown",
+                            target_vlan=e["target_vlan"],
+                            live_vlan="Unknown",
+                            reason=f"Switch connection/processing failed: {reason}",
+                        )
                         write_result_columns(
                             ws,
                             e["row_idx"],
@@ -854,22 +1100,25 @@ def main():
         f"Changed: {stats['chg']} | Failed: {stats['fail']} | Declined: {stats['dec']}"
     )
 
-    final_message = f"Execution completed. Changed: {stats['chg']}, Failed: {stats['fail']}"
-    if no_change_highlights:
-        row_notes = [
-            f"{e['sheet']} row {e['row']} ({e['port']} VLAN {e['vlan']})"
-            for e in no_change_highlights
-        ]
-        shown = ", ".join(row_notes[:20])
-        if len(row_notes) > 20:
-            shown = f"{shown}, and {len(row_notes) - 20} more"
-        log(f"[*] No change needed on highlighted rows: {shown}")
-        final_message = f"{final_message}\n\nNo change needed on highlighted rows: {shown}"
+    for bucket, label in [
+        ("changed", "Changed"),
+        ("unchanged", "Already correct"),
+        ("declined", "Declined"),
+        ("failed", "Failed"),
+    ]:
+        for e in report[bucket]:
+            log(
+                f"[REPORT] {label} | {e['sheet']} row {e['row']} | Switch {e['switch']} | "
+                f"Port {e['port']} | Old {e.get('old_vlan', 'Unknown')} | "
+                f"Target {e.get('target_vlan', 'Unknown')} | Live {e.get('live_vlan', 'Unknown')} | "
+                f"{e.get('reason', '')}"
+            )
+
+    final_message = build_teams_text(st, stats, report)
 
     send_teams_notification(
         st,
         final_message,
-        summary if stats["chg"] > 0 else None
     )
 
 if __name__ == "__main__":
