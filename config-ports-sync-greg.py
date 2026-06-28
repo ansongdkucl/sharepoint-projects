@@ -165,11 +165,56 @@ def wait_for_excel_lock_to_clear(path, timeout=30):
         time.sleep(1)
     return False
 
-def open_save_close_in_excel(path):
-    if os.getenv("SKIP_EXCEL_PRE_SYNC", "").strip().lower() in {"1", "true", "yes"}:
-        log(f"[*] Excel pre-sync skipped for {path.name} because SKIP_EXCEL_PRE_SYNC is set.")
-        return
+def get_windows_file_attributes(path):
+    if os.name != "nt":
+        return None
 
+    try:
+        import ctypes
+    except ImportError:
+        return None
+
+    attrs = ctypes.windll.kernel32.GetFileAttributesW(str(path))
+    if attrs == 0xFFFFFFFF:
+        return None
+    return attrs
+
+def workbook_sync_state(path):
+    attrs = get_windows_file_attributes(path)
+    if attrs is None:
+        return "unknown"
+
+    flags = []
+    checks = [
+        ("offline", 0x00001000),
+        ("recall-on-open", 0x00040000),
+        ("recall-on-data-access", 0x00400000),
+        ("pinned", 0x00080000),
+        ("unpinned", 0x00100000),
+    ]
+    for name, bit in checks:
+        if attrs & bit:
+            flags.append(name)
+
+    return ", ".join(flags) if flags else "local"
+
+def should_excel_pre_sync(path):
+    if os.getenv("SKIP_EXCEL_PRE_SYNC", "").strip().lower() in {"1", "true", "yes"}:
+        return False, "SKIP_EXCEL_PRE_SYNC is set"
+
+    if os.getenv("FORCE_EXCEL_PRE_SYNC", "").strip().lower() in {"1", "true", "yes"}:
+        return True, "FORCE_EXCEL_PRE_SYNC is set"
+
+    state = workbook_sync_state(path)
+    if any(flag in state for flag in ("offline", "recall-on-open", "recall-on-data-access", "unpinned")):
+        return True, f"OneDrive file attributes indicate not fully local: {state}"
+
+    if state == "unknown":
+        return False, "sync state unknown; file exists locally, so skipping Excel pre-sync"
+
+    return False, f"OneDrive file attributes look local: {state}"
+
+def open_save_close_in_excel(path):
     lock_path = path.parent / f"~${path.name}"
     if lock_path.exists():
         raise RuntimeError(f"Workbook is already open by {get_lock_owner(path)}.")
@@ -696,15 +741,18 @@ def main():
         sys.exit(1)
 
     pre_sync_warning = ""
-    try:
-        open_save_close_in_excel(DEFAULT_PATH)
-    except RuntimeError as exc:
-        if excel_pre_sync_required():
-            log(f"[!] ABORTED: {exc}")
-            sys.exit(1)
-        pre_sync_warning = str(exc)
-        log(f"[!] Excel pre-sync warning: {pre_sync_warning}")
-        log("[*] Continuing because EXCEL_PRE_SYNC_REQUIRED is not set.")
+    needs_pre_sync, pre_sync_reason = should_excel_pre_sync(DEFAULT_PATH)
+    log(f"[*] Excel pre-sync check: {pre_sync_reason}")
+    if needs_pre_sync:
+        try:
+            open_save_close_in_excel(DEFAULT_PATH)
+        except RuntimeError as exc:
+            if excel_pre_sync_required():
+                log(f"[!] ABORTED: {exc}")
+                sys.exit(1)
+            pre_sync_warning = str(exc)
+            log(f"[!] Excel pre-sync warning: {pre_sync_warning}")
+            log("[*] Continuing because EXCEL_PRE_SYNC_REQUIRED is not set.")
 
     lk = DEFAULT_PATH.parent / f"~${DEFAULT_PATH.name}"
     if lk.exists():
