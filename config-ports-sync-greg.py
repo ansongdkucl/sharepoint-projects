@@ -185,17 +185,32 @@ def open_save_close_in_excel(path):
                 "pywin32 is required for Excel pre-sync on Windows. Install it with: pip install pywin32"
             ) from exc
 
-        excel = win32com.client.DispatchEx("Excel.Application")
-        excel.DisplayAlerts = False
-        excel.Visible = False
+        excel = None
         wb = None
         try:
+            excel = win32com.client.DispatchEx("Excel.Application")
+            excel.DisplayAlerts = False
+            excel.Visible = False
             wb = excel.Workbooks.Open(excel_path, UpdateLinks=0, ReadOnly=False)
             wb.Save()
+        except Exception as exc:
+            raise RuntimeError(
+                f"Excel could not open/save {path.name}. "
+                "This commonly happens when the self-hosted runner is running as a Windows service, "
+                "the workbook is already open in another Excel session, or OneDrive has not synced the file "
+                f"for the runner user. Excel path: {excel_path}. Details: {exc}"
+            ) from exc
         finally:
             if wb is not None:
-                wb.Close(SaveChanges=False)
-            excel.Quit()
+                try:
+                    wb.Close(SaveChanges=False)
+                except Exception:
+                    pass
+            if excel is not None:
+                try:
+                    excel.Quit()
+                except Exception:
+                    pass
     else:
         ps_script = r"""
 $path = $args[0]
@@ -238,6 +253,9 @@ try {
         raise RuntimeError(f"Excel lock did not clear after saving {path.name}.")
 
     log(f"[+] Excel pre-sync complete: {path.name}")
+
+def excel_pre_sync_required():
+    return os.getenv("EXCEL_PRE_SYNC_REQUIRED", "").strip().lower() in {"1", "true", "yes"}
 
 def confirm_change(safe, ip, port, cur, tgt, row, s_name):
     if not safe:
@@ -677,11 +695,16 @@ def main():
         log("[!] Missing environment variable: passwordAD")
         sys.exit(1)
 
+    pre_sync_warning = ""
     try:
         open_save_close_in_excel(DEFAULT_PATH)
     except RuntimeError as exc:
-        log(f"[!] ABORTED: {exc}")
-        sys.exit(1)
+        if excel_pre_sync_required():
+            log(f"[!] ABORTED: {exc}")
+            sys.exit(1)
+        pre_sync_warning = str(exc)
+        log(f"[!] Excel pre-sync warning: {pre_sync_warning}")
+        log("[*] Continuing because EXCEL_PRE_SYNC_REQUIRED is not set.")
 
     lk = DEFAULT_PATH.parent / f"~${DEFAULT_PATH.name}"
     if lk.exists():
@@ -1115,6 +1138,12 @@ def main():
             )
 
     final_message = build_teams_text(st, stats, report)
+    if pre_sync_warning:
+        final_message = (
+            f"{final_message}\n\n"
+            f"Excel pre-sync warning:\n{pre_sync_warning}\n"
+            "The script continued after the normal workbook access checks."
+        )
 
     send_teams_notification(
         st,
