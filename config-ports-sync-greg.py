@@ -309,6 +309,22 @@ def parse_sheet_filter(value):
         if item.strip()
     }
 
+def parse_row_filter(value):
+    rows = set()
+    for item in str(value or "").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "-" in item:
+            start, end = item.split("-", 1)
+            if start.strip().isdigit() and end.strip().isdigit():
+                lo, hi = int(start), int(end)
+                rows.update(range(min(lo, hi), max(lo, hi) + 1))
+            continue
+        if item.isdigit():
+            rows.add(int(item))
+    return rows
+
 def confirm_change(safe, ip, port, cur, tgt, row, s_name):
     if not safe:
         return True
@@ -563,6 +579,29 @@ def is_highlighted_row(ws, row):
         return True
     return any(is_yellow_fill(ws.cell(row=row, column=c).fill) for c in range(1, ws.max_column + 1))
 
+def fill_debug_summary(ws, row):
+    parts = []
+    row_fill = ws.row_dimensions[row].fill
+    if row_fill and row_fill.fill_type:
+        parts.append(
+            f"row-fill type={row_fill.fill_type} "
+            f"fg={row_fill.fgColor.type}:{row_fill.fgColor.rgb or row_fill.fgColor.indexed or row_fill.fgColor.theme} "
+            f"start={row_fill.start_color.type}:{row_fill.start_color.rgb or row_fill.start_color.indexed or row_fill.start_color.theme}"
+        )
+
+    for c in range(1, ws.max_column + 1):
+        cell = ws.cell(row=row, column=c)
+        fill = cell.fill
+        if not fill or not fill.fill_type:
+            continue
+        parts.append(
+            f"{cell.coordinate} type={fill.fill_type} "
+            f"fg={fill.fgColor.type}:{fill.fgColor.rgb or fill.fgColor.indexed or fill.fgColor.theme} "
+            f"start={fill.start_color.type}:{fill.start_color.rgb or fill.start_color.indexed or fill.start_color.theme}"
+        )
+
+    return "; ".join(parts[:20]) if parts else "no explicit row/cell fills found by openpyxl"
+
 def clear_yellow_highlight(ws, row):
     if is_yellow_fill(ws.row_dimensions[row].fill):
         ws.row_dimensions[row].fill = PatternFill(fill_type=None)
@@ -735,6 +774,11 @@ def main():
         action="store_true",
         help="Process every worksheet instead of only the configured sheet filter.",
     )
+    parser.add_argument(
+        "--rows",
+        default=os.getenv("ROWS_TO_PROCESS", ""),
+        help="Optional comma-separated row numbers or ranges to process even if yellow fill is not detected, for example 30,31 or 30-35.",
+    )
     args = parser.parse_args()
     if args.workbook:
         DEFAULT_PATH = normalize_workbook_path(args.workbook)
@@ -826,6 +870,10 @@ def main():
     if args.dry_run:
         log("!!!!!!!!!!!!!!!!!!!! DRY RUN ACTIVE !!!!!!!!!!!!!!!!!!!!")
 
+    forced_rows = parse_row_filter(args.rows)
+    if forced_rows:
+        log(f"[*] Forced row filter active: {sorted(forced_rows)}")
+
     blocks_by_sheet = defaultdict(list)
     for ws, b in all_blocks:
         blocks_by_sheet[ws.title].append(b)
@@ -838,19 +886,20 @@ def main():
         outside_rows = [
             r
             for r in range(1, ws.max_row + 1)
-            if is_highlighted_row(ws, r) and r not in covered_rows
+            if (is_highlighted_row(ws, r) or r in forced_rows) and r not in covered_rows
         ]
         if not outside_rows:
             continue
 
         log(
-            f"[!] Highlighted row(s) on sheet '{ws.title}' are outside detected data blocks "
+            f"[!] Highlighted/forced row(s) on sheet '{ws.title}' are outside detected data blocks "
             f"and will not be processed: {outside_rows}"
         )
         for r in outside_rows:
-            reason = "Highlighted row is outside detected data blocks"
+            reason = "Highlighted/forced row is outside detected data blocks"
             stats["fail"] += 1
             log_row_failure(r, "Unknown", "Unknown", "Unknown", reason)
+            log(f"[*] Fill debug for {ws.title} row {r}: {fill_debug_summary(ws, r)}")
             record_report(
                 report,
                 "failed",
@@ -878,8 +927,16 @@ def main():
         skipped_highlights = []
 
         for r in range(b["data_start"], b["data_end"] + 1):
-            if not is_highlighted_row(ws, r):
+            highlighted = is_highlighted_row(ws, r)
+            forced = r in forced_rows
+            if not highlighted and not forced:
                 continue
+
+            if forced:
+                log(
+                    f"[*] Forced row {r} on sheet '{ws.title}' selected. "
+                    f"Yellow detected: {highlighted}. Fill debug: {fill_debug_summary(ws, r)}"
+                )
 
             sw, pt, tg = [
                 clean_text(ws.cell(row=r, column=cols[k]).value)
@@ -887,7 +944,8 @@ def main():
             ]
             if sw and pt and tg:
                 highlighted_rows += 1
-                queued_highlights.append(f"{r} ({sw} {pt} -> VLAN {tg})")
+                source = "yellow" if highlighted else "forced"
+                queued_highlights.append(f"{r} [{source}] ({sw} {pt} -> VLAN {tg})")
                 rows_by_sw[sw].append({
                     "row_idx": r,
                     "port": pt,
