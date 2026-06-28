@@ -302,6 +302,13 @@ try {
 def excel_pre_sync_required():
     return os.getenv("EXCEL_PRE_SYNC_REQUIRED", "").strip().lower() in {"1", "true", "yes"}
 
+def parse_sheet_filter(value):
+    return {
+        normalize_header(item)
+        for item in str(value or "").split(",")
+        if item.strip()
+    }
+
 def confirm_change(safe, ip, port, cur, tgt, row, s_name):
     if not safe:
         return True
@@ -718,6 +725,16 @@ def main():
         default=None,
         help="Workbook path. Accepts Windows paths under WSL, for example C:\\Users\\anson\\...\\FC-MSA-CI.xlsx",
     )
+    parser.add_argument(
+        "--sheets",
+        default=os.getenv("SHEETS_TO_PROCESS", "Foster Court"),
+        help="Comma-separated sheet names to process. Default: Foster Court. Use '*' with --sheets or SHEETS_TO_PROCESS to process all sheets.",
+    )
+    parser.add_argument(
+        "--all-sheets",
+        action="store_true",
+        help="Process every worksheet instead of only the configured sheet filter.",
+    )
     args = parser.parse_args()
     if args.workbook:
         DEFAULT_PATH = normalize_workbook_path(args.workbook)
@@ -775,7 +792,27 @@ def main():
         log(f"[!] Load error: {exc}")
         sys.exit(1)
 
-    all_blocks = [(ws, b) for ws in wb.worksheets for b in collect_sheet_blocks(ws)]
+    sheet_filter = parse_sheet_filter(args.sheets)
+    process_all_sheets = args.all_sheets or "*" in sheet_filter or "all" in sheet_filter
+    if process_all_sheets:
+        worksheets_to_process = list(wb.worksheets)
+        log("[*] Sheet filter: all worksheets")
+    else:
+        worksheets_to_process = [
+            ws for ws in wb.worksheets if normalize_header(ws.title) in sheet_filter
+        ]
+        log(f"[*] Sheet filter: {', '.join(item.strip() for item in args.sheets.split(',') if item.strip())}")
+
+        if not worksheets_to_process:
+            log(f"[!] No worksheets matched sheet filter: {args.sheets}")
+            log(f"[*] Available worksheets: {wb.sheetnames}")
+            sys.exit(1)
+
+        skipped_sheet_names = [ws.title for ws in wb.worksheets if ws not in worksheets_to_process]
+        if skipped_sheet_names:
+            log(f"[*] Skipping worksheets by filter: {skipped_sheet_names}")
+
+    all_blocks = [(ws, b) for ws in worksheets_to_process for b in collect_sheet_blocks(ws)]
     log(f"[*] Total blocks found: {len(all_blocks)}")
 
     if not all_blocks:
@@ -789,6 +826,44 @@ def main():
     if args.dry_run:
         log("!!!!!!!!!!!!!!!!!!!! DRY RUN ACTIVE !!!!!!!!!!!!!!!!!!!!")
 
+    blocks_by_sheet = defaultdict(list)
+    for ws, b in all_blocks:
+        blocks_by_sheet[ws.title].append(b)
+
+    for ws in worksheets_to_process:
+        covered_rows = set()
+        for b in blocks_by_sheet.get(ws.title, []):
+            covered_rows.update(range(b["data_start"], b["data_end"] + 1))
+
+        outside_rows = [
+            r
+            for r in range(1, ws.max_row + 1)
+            if is_highlighted_row(ws, r) and r not in covered_rows
+        ]
+        if not outside_rows:
+            continue
+
+        log(
+            f"[!] Highlighted row(s) on sheet '{ws.title}' are outside detected data blocks "
+            f"and will not be processed: {outside_rows}"
+        )
+        for r in outside_rows:
+            reason = "Highlighted row is outside detected data blocks"
+            stats["fail"] += 1
+            log_row_failure(r, "Unknown", "Unknown", "Unknown", reason)
+            record_report(
+                report,
+                "failed",
+                sheet=ws.title,
+                row=r,
+                switch="Unknown",
+                port="Unknown",
+                old_vlan="Unknown",
+                target_vlan="Unknown",
+                live_vlan="Unknown",
+                reason=reason,
+            )
+
     for ws, b in all_blocks:
         log(
             f"[*] Processing sheet '{b['sheet_name']}' "
@@ -799,6 +874,7 @@ def main():
         cols = b["columns"]
         rows_by_sw = defaultdict(list)
         highlighted_rows = 0
+        queued_highlights = []
         skipped_highlights = []
 
         for r in range(b["data_start"], b["data_end"] + 1):
@@ -811,6 +887,7 @@ def main():
             ]
             if sw and pt and tg:
                 highlighted_rows += 1
+                queued_highlights.append(f"{r} ({sw} {pt} -> VLAN {tg})")
                 rows_by_sw[sw].append({
                     "row_idx": r,
                     "port": pt,
@@ -861,6 +938,8 @@ def main():
                     wb_touch = True
 
         log(f"[*] Highlighted rows queued in this block: {highlighted_rows}")
+        if queued_highlights:
+            log(f"[*] Queued highlighted row detail: {queued_highlights}")
         if skipped_highlights:
             log(f"[!] Highlighted rows skipped due to missing switch/port/VLAN: {skipped_highlights}")
         log(f"[*] Unique switches in this block: {len(rows_by_sw)}")
