@@ -5,9 +5,13 @@ on:
     - cron: '*/5 * * * *'
   workflow_dispatch:
 
+defaults:
+  run:
+    shell: powershell
+
 jobs:
   run-sync:
-    runs-on: self-hosted
+    runs-on: [self-hosted, windows, x64]
     timeout-minutes: 20
 
     steps:
@@ -22,19 +26,21 @@ jobs:
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install netmiko openpyxl python-dotenv requests
+          pip install netmiko openpyxl python-dotenv requests pywin32
 
       - name: Show working directory
         run: |
-          pwd
-          ls -la
+          $PSVersionTable.PSVersion
+          Get-Location
+          Get-ChildItem -Force
 
       - name: Execute Port Sync Script
         env:
           username: ${{ secrets.username }}
           passwordAD: ${{ secrets.passwordAD }}
           TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
-        run: python config-ports-sync.py
+          WORKBOOK_PATH: 'C:\Users\cceadan\University College London\ISD.ITSD.CO.Technical Specialists - patching\FC-MSA-CI.xlsx'
+        run: python config-ports-sync-greg.py
 
       - name: Upload debug log on failure
         if: failure()
