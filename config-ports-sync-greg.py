@@ -18,8 +18,8 @@ TEAMS_WEBHOOK_URL = os.getenv("TEAMS_WEBHOOK_URL", "")
 
 RUN_ACTOR = os.getenv("GITHUB_ACTOR") or os.getenv("USER") or os.getenv("USERNAME") or "unknown"
 RUN_SOURCE = "GitHub Actions" if os.getenv("GITHUB_ACTIONS", "").lower() == "true" else "Manual"
-WORKBOOK_NAME = "FC-MSA-CI.xlsx"
-#WORKBOOK_NAME = "FC-MSA-CI-test1.xlsx"
+#WORKBOOK_NAME = "FC-MSA-CI.xlsx"
+WORKBOOK_NAME = "FC-MSA-CI-test1.xlsx"
 WORKBOOK_DIR = r"University College London\ISD.ITSD.CO.Technical Specialists - patching"
 WINDOWS_WORKBOOK_PATHS = [
     rf"C:\Users\anson\{WORKBOOK_DIR}\{WORKBOOK_NAME}",
