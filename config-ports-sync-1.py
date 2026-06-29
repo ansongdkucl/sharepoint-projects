@@ -374,11 +374,17 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--safe", action="store_true", help="Confirm each VLAN change manually")
     parser.add_argument("--dry-run", action="store_true", help="Show what would change without applying it")
+    parser.add_argument(
+        "--check-all",
+        action="store_true",
+        help="Check all rows and write live MAC/IP even if the VLAN is already correct",
+    )
     args = parser.parse_args()
 
     log("[*] Script starting")
     log(f"[*] Safe mode: {args.safe}")
     log(f"[*] Dry run: {args.dry_run}")
+    log(f"[*] Check all rows: {args.check_all}")
     log(f"[*] Candidate file path: {DEFAULT_PATH}")
     log(f"[*] Run By: {RUN_ACTOR}")
     log(f"[*] Source: {RUN_SOURCE}")
@@ -477,7 +483,17 @@ def main():
 
                     if current_vlan == target_vlan:
                         rows_already_correct += 1
-                        # No Excel write and no console noise for rows already correct
+                        if args.check_all:
+                            write_readonly_columns(
+                                ws,
+                                row_idx,
+                                header_map,
+                                mac=live_details["mac"],
+                                ip=live_details["ip"],
+                                last_checked=checked_at,
+                                notes="Already correct VLAN",
+                            )
+                            workbook_touched = True
                         continue
 
                     candidate_changes += 1

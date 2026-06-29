@@ -2,7 +2,9 @@
   "rules": [
     {
       "name": "Access point",
-      "prefixes": ["d4:19:72"],
+      "prefixes": ["d4:19:72",
+                  "b0:1f:8c"],
+                  
       "allowed_vlans": ["990"]
     },
     {

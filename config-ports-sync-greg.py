@@ -52,6 +52,11 @@ DEFAULT_PATH = first_existing_path([os.getenv("WORKBOOK_PATH"), *WINDOWS_WORKBOO
 def now_str():
     return datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
 
+def friendly_now_str():
+    dt = datetime.now().astimezone()
+    hour = dt.strftime("%I").lstrip("0") or "0"
+    return f"{dt.strftime('%A')} {hour}{dt.strftime('%p').lower()} on the {dt.day}/{dt.month}/{dt.year}"
+
 def log(msg):
     print(msg, flush=True)
 
@@ -342,10 +347,8 @@ def confirm_change(safe, ip, port, cur, tgt, row, s_name):
 # ============================================================
 def build_teams_text(status, stats, report):
     lines = [
-        f"Aruba Port Sync: {status}",
-        "",
         f"Run by: {RUN_ACTOR}",
-        f"Run at: {now_str()}",
+        f"Run at on {friendly_now_str()}",
         f"Source: {RUN_SOURCE}",
         f"File: {DEFAULT_PATH.name}",
         "",
@@ -897,21 +900,9 @@ def main():
         )
         for r in outside_rows:
             reason = "Highlighted/forced row is outside detected data blocks"
-            stats["fail"] += 1
-            log_row_failure(r, "Unknown", "Unknown", "Unknown", reason)
-            log(f"[*] Fill debug for {ws.title} row {r}: {fill_debug_summary(ws, r)}")
-            record_report(
-                report,
-                "failed",
-                sheet=ws.title,
-                row=r,
-                switch="Unknown",
-                port="Unknown",
-                old_vlan="Unknown",
-                target_vlan="Unknown",
-                live_vlan="Unknown",
-                reason=reason,
-            )
+            log(f"[*] Ignored row {r} on sheet '{ws.title}': {reason}")
+            if r in forced_rows:
+                log(f"[*] Fill debug for {ws.title} row {r}: {fill_debug_summary(ws, r)}")
 
     for ws, b in all_blocks:
         log(

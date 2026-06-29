@@ -2,5 +2,6 @@ msal
 netmiko
 openpyxl
 pandas
+pywin32; platform_system == "Windows"
 python-dotenv
 requests

@@ -1,7 +1,9 @@
 import os
 import re
+import subprocess
 import sys
 import argparse
+import time
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -61,11 +63,9 @@ candidate_files.extend(
 # 3. WSL/Linux fallback paths
 candidate_files.extend(
     [
+      
         Path(
-            "/mnt/c/Users/cceadan/OneDrive - University College London/Estates IT - Project Documentation - Patching Schedule/90TCR - Daniel Test.xlsx"
-        ),
-        Path(
-            "/mnt/c/Users/cceadan/OneDrive - University College London/Estates IT - Project Documentation - Patching Schedule/90TCR - Level 3B - Patching Schedule.xlsx"
+            "/mnt/c/Users/cceadan/OneDrive - University College London/Estates IT - Project Documentation - Patching Schedule/90TCR - Level 2B - Patching Schedule.xlsx"
         ),
         Path(
             "/mnt/c/Users/cceadan/Downloads/90 TCR - Daniel-Test.xlsx"
@@ -134,6 +134,108 @@ def get_lock_owner(path):
             return match.group(0).strip() if match else "a Colleague"
     except Exception:
         return "a Colleague"
+
+
+def windows_excel_path(path):
+    path = Path(path)
+    text = str(path)
+
+    if os.name == "nt":
+        return text
+
+    match = re.match(r"^/mnt/([a-zA-Z])/(.*)$", text)
+    if not match:
+        return text
+
+    drive, rest = match.groups()
+    rest = rest.replace("/", "\\")
+    return f"{drive.upper()}:\\{rest}"
+
+
+def wait_for_excel_lock_to_clear(path, timeout=30):
+    lock_path = path.parent / f"~${path.name}"
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not lock_path.exists():
+            return True
+        time.sleep(1)
+    return False
+
+
+def open_save_close_in_excel(path):
+    if os.getenv("SKIP_EXCEL_PRE_SYNC", "").strip().lower() in {"1", "true", "yes"}:
+        log(f"[*] Excel pre-sync skipped for {path.name} because SKIP_EXCEL_PRE_SYNC is set.")
+        return
+
+    lock_path = path.parent / f"~${path.name}"
+    if lock_path.exists():
+        owner = get_lock_owner(path)
+        raise RuntimeError(f"{path.name} is already open by {owner}")
+
+    excel_path = windows_excel_path(path)
+    log(f"[*] Opening and saving in Excel to refresh SharePoint/OneDrive sync: {path.name}")
+
+    if os.name == "nt":
+        try:
+            import win32com.client
+        except ImportError as exc:
+            raise RuntimeError(
+                "pywin32 is required for Excel pre-sync on Windows. Install it with: pip install pywin32"
+            ) from exc
+
+        excel = win32com.client.DispatchEx("Excel.Application")
+        excel.DisplayAlerts = False
+        excel.Visible = False
+        wb = None
+        try:
+            wb = excel.Workbooks.Open(excel_path, UpdateLinks=0, ReadOnly=False)
+            wb.Save()
+        finally:
+            if wb is not None:
+                wb.Close(SaveChanges=False)
+            excel.Quit()
+    else:
+        ps_script = r"""
+$path = $args[0]
+$excel = New-Object -ComObject Excel.Application
+$excel.DisplayAlerts = $false
+$excel.Visible = $false
+$workbook = $null
+try {
+    $workbook = $excel.Workbooks.Open($path, 0, $false)
+    $workbook.Save()
+} finally {
+    if ($workbook -ne $null) {
+        $workbook.Close($false)
+        [System.Runtime.InteropServices.Marshal]::ReleaseComObject($workbook) | Out-Null
+    }
+    $excel.Quit()
+    [System.Runtime.InteropServices.Marshal]::ReleaseComObject($excel) | Out-Null
+    [GC]::Collect()
+    [GC]::WaitForPendingFinalizers()
+}
+"""
+        try:
+            result = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_script, excel_path],
+                capture_output=True,
+                text=True,
+                timeout=120,
+                check=False,
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError(
+                "powershell.exe was not found. Excel pre-sync needs Windows PowerShell when running from WSL."
+            ) from exc
+
+        if result.returncode != 0:
+            details = (result.stderr or result.stdout or "").strip()
+            raise RuntimeError(f"Excel pre-sync failed for {path.name}: {details}")
+
+    if not wait_for_excel_lock_to_clear(path):
+        raise RuntimeError(f"Excel lock did not clear after saving {path.name}")
+
+    log(f"[+] Excel pre-sync complete: {path.name}")
 
 
 def confirm_change(safe_mode, switch_ip, port, current_vlan, target_vlan, row_idx):
@@ -372,11 +474,18 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--safe", action="store_true", help="Confirm each VLAN change manually")
     parser.add_argument("--dry-run", action="store_true", help="Show what would change without applying it")
+    parser.add_argument(
+        "--start-row",
+        type=int,
+        default=4,
+        help="Start processing from this spreadsheet row number (default: 4)",
+    )
     args = parser.parse_args()
 
     log("[*] Script starting")
     log(f"[*] Safe mode: {args.safe}")
     log(f"[*] Dry run: {args.dry_run}")
+    log(f"[*] Start row: {args.start_row}")
     log(f"[*] Candidate file path: {DEFAULT_PATH}")
     log(f"[*] Run By: {RUN_ACTOR}")
     log(f"[*] Source: {RUN_SOURCE}")
@@ -389,6 +498,12 @@ def main():
 
     if not USERNAME or not PASSWORD:
         log("[!] ERROR: Missing username/passwordAD environment variables.")
+        sys.exit(1)
+
+    try:
+        open_save_close_in_excel(DEFAULT_PATH)
+    except RuntimeError as exc:
+        log(f"[!] ABORTED: {exc}")
         sys.exit(1)
 
     lock_file = DEFAULT_PATH.parent / f"~${DEFAULT_PATH.name}"
@@ -418,9 +533,13 @@ def main():
         log(f"[!] ERROR: Missing required headers: {missing}")
         sys.exit(1)
 
+    if args.start_row < 4:
+        log("[!] ERROR: --start-row must be 4 or greater.")
+        sys.exit(1)
+
     rows_by_switch = defaultdict(list)
 
-    for row_idx in range(4, ws.max_row + 1):
+    for row_idx in range(args.start_row, ws.max_row + 1):
         switch_ip = clean_text(ws.cell(row=row_idx, column=header_map["switch_ip"]).value)
         port = clean_text(ws.cell(row=row_idx, column=header_map["port"]).value)
         target_vlan = clean_text(ws.cell(row=row_idx, column=header_map["target_vlan"]).value)
@@ -701,3 +820,8 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+#python config-ports-sync-greg.py --sheets "Foster Court"
+#python config-ports-sync-greg.py --sheets "Foster Court,Ingold"
+#python config-ports-sync-greg.py --all-sheets
